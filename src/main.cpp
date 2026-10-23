@@ -1,100 +1,149 @@
-#include <Arduino.h>
-#include <Wire.h>
-#include <Adafruit_GFX.h>
-#include <Adafruit_LEDBackpack.h>
+#include <Arduino.h>               // Підключення основного заголовочного файлу Arduino для ESP32
+#include <Wire.h>                  // Підключення бібліотеки для роботи з шиною I2C
+#include <Adafruit_GFX.h>          // Підключення базової графічної бібліотеки Adafruit GFX
+#include <Adafruit_LEDBackpack.h>  // Підключення бібліотеки для світлодіодної матриці на HT16K33
+#include <TM1650.h>                // Підключення бібліотеки для 4-розрядного дисплея TM1650
 
-#define LED_PIN_1 2
-#define LED_PIN_2 4
-#define BUTTON_PIN 15 // Оголошуємо номер піна, до якого підключена кнопка
-#define BUZZER_PIN 14
+#define LED_PIN_1 2                // Призначаємо пін 2 для першого світлодіода мигалки
+#define LED_PIN_2 4                // Призначаємо пін 4 для другого світлодіода мигалки
+#define BUTTON_PIN 15              // Призначаємо пін 15 для тактової кнопки керування
+#define BUZZER_PIN 14              // Призначаємо пін 14 для звукового випромінювача (бузера)
 
-Adafruit_8x8matrix matrix = Adafruit_8x8matrix(); // Створюємо об'єкт для матриці 8x8 на базі VK16K33 / HT16K33
-bool isRunning = false;       // Прапор стану: true — мигалка працює, false — вимкнена
-bool lastButtonState = HIGH;  // Змінна для збереження попереднього стану кнопки (HIGH = не натиснута)
+Adafruit_8x8matrix matrix = Adafruit_8x8matrix(); // Створюємо об'єкт світлодіодної матриці 8х8
+TM1650 disp4;                      // Створюємо об'єкт для керування дисплеєм TM1650 по I2C
 
-// Масив букв для нашої матриці 8х8 (виводитимемо по одній)
-char policeWord[] = {'P', 'O', 'L', 'I', 'C', 'E'};
-int currentLetter = 0;
+bool isRunning = false;            // Прапор стану системи: false — вимкнено, true — запущено
+bool lastButtonState = HIGH;       // Змінна для збереження попереднього стану кнопки (HIGH у режимі PULLUP)
 
+char policeWord[] = {'P', 'O', 'L', 'I', 'C', 'E'}; // Масив символів слова "POLICE" для матриці
+int currentLetter = 0;             // Індекс поточної букви, яка виводиться на матрицю
+
+unsigned long chaseStartTime = 0;  // Змінна для фіксації часу старт секундоміра
+unsigned long previousMillis = 0;  // Змінна для неблокуючого таймера подій (сирена/літери)
+const long interval = 200;         // Інтервал зміни мигалки, звуку та букви (200 мс)
+bool sirenPhase = false;           // Логічний прапор для перемикання фаз сирени
+
+/**
+ * ==============================================================================
+ * ФУНКЦІЯ: setup()
+ * Призначення: Виконується один раз під час запуску або перезавантаження ESP32.
+ * Що робить: Налаштовує режими пінів, запускає шину I2C, ініціалізує 
+ * світлодіодну матрицю 8x8 та 4-розрядний дисплей TM1650.
+ * ==============================================================================
+ */
 void setup() {
-  pinMode(LED_PIN_1, OUTPUT);
-  pinMode(LED_PIN_2, OUTPUT);
-  pinMode(BUTTON_PIN, INPUT_PULLUP);
-  pinMode(BUZZER_PIN, OUTPUT);
-  // Явно ініціалізуємо I2C шину для ESP32 (SDA = 21, SCL = 22)
-  Wire.begin(21, 22);
-  // Ініціалізація матриці (адреса за замовчуванням 0x70)
-  matrix.begin(0x70); 
-  matrix.setBrightness(8); 
-  matrix.clear();
-  matrix.writeDisplay();
-}
+  Serial.begin(115200);            // Запускаємо Serial Monitor на швидкості 115200 бод
+  pinMode(LED_PIN_1, OUTPUT);      // Налаштовуємо пін першого світлодіода як вихід
+  pinMode(LED_PIN_2, OUTPUT);      // Налаштовуємо пін другого світлодіода як вихід
+  pinMode(BUTTON_PIN, INPUT_PULLUP); // Налаштовуємо пін кнопки як вхід із підтяжкою до живлення
+  pinMode(BUZZER_PIN, OUTPUT);     // Налаштовуємо пін бузера як вихід
 
-// Функція для виведення однієї букви по центру матриці
+  Wire.begin(21, 22);              // Ініціалізуємо шину I2C на пінах SDA=21 та SCL=22 для ESP32
+  matrix.begin(0x70);              // Ініціалізуємо матрицю 8x8 за її стандартною I2C адресою 0x70
+
+  disp4.init();                    // Запускаємо ініціалізацію дисплея TM1650
+  disp4.setBrightness(4);          // Встановлюємо середню яскравість дисплея (від 0 до 7)
+  disp4.displayOn();               // Увімкнення дисплея в активний режим
+
+  char testStr[] = "8888";
+  disp4.displayString(testStr);    // Виводимо тестовий рядок без попереджень
+}  
+
+/**
+ * ==============================================================================
+ * ФУНКЦІЯ: showChar(char letter)
+ * Призначення: Виводить переданий символ по центру світлодіодної матриці 8х8.
+ * Що робить: Очищає буфер матриці, задає параметри тексту, встановлює курсор 
+ * у центр (координати x=2, y=0) та відправляє зображення на фізичний екран.
+ * ==============================================================================
+ */
 void showChar(char letter) {
-  matrix.clear();
-  matrix.setTextSize(1);      
-  matrix.setTextWrap(false);  
-  matrix.setTextColor(LED_ON);
+  matrix.clear();                  // Очищаємо буфер матриці перед виведенням нового символу
+  matrix.setTextSize(1);           // Встановлюємо стандартний розмір шрифту (1)
+  matrix.setTextWrap(false);       // Вимикаємо автоперенесення тексту на наступний рядок
+  matrix.setTextColor(LED_ON);     // Встановлюємо колір тексту (увімкнені світлодіоди)
   
-  matrix.setCursor(2, 0);     // Центруємо букву на екрані 8х8
-  matrix.print(letter);
-  matrix.writeDisplay();      
+  matrix.setCursor(2, 0);          // Зміщуємо курсор у позицію (2, 0) для центрування букви
+  matrix.print(letter);            // Записуємо передану букву в буфер матриці
+  matrix.writeDisplay();           // Відображаємо буфер на фізичній матриці 8х8
 }
 
+/**
+ * ==============================================================================
+ * ФУНКЦІЯ: loop()
+ * Призначення: Головний нескінченний цикл програми.
+ * Що робить: Миттєво оновлює секунди та десяті частки секунди (остання цифра 0-9) 
+ * на дисплеї, а кожні 200 мс за допомогою неблокуючого таймера перемикає фазу 
+ * сирени та літеру слова "POLICE" на матриці.
+ * ==============================================================================
+ */
 void loop() {
-  bool currentButtonState = digitalRead(BUTTON_PIN); // Зчитуємо поточний стан кнопки (LOW або HIGH)
+  bool currentButtonState = digitalRead(BUTTON_PIN); // Зчитуємо поточний електричний стан кнопки
 
-  // Перевіряємо фронт натискання: кнопка була відпущена (HIGH), а стала натиснута (LOW)
+  // Перевірка факту натискання (перехід від HIGH до LOW через підтяжку PULLUP)
   if (currentButtonState == LOW && lastButtonState == HIGH) {
-    isRunning = !isRunning; // Змінюємо стан режиму на протилежний (увімкнути/вимкнути)
-    delay(50);              // Затримка 50 мс для захисту від дрижання контактів (антидребезг)
+    isRunning = !isRunning;        // Інвертуємо поточний стан режиму (було false — стане true, і навпаки)
+    delay(50);                     // Коротка затримка 50 мс лише для захисту від дребезгу кнопки
   }
 
-  lastButtonState = currentButtonState; // Зберігаємо поточний стан кнопки для наступного циклу
-                                  // Якщо режим увімкнений — виконуємо мигання
+  lastButtonState = currentButtonState; // Оновлюємо попередній стан кнопки для наступного циклу
   
-  if (isRunning) {
+  if (isRunning) {                 // Якщо режим роботи увімкнено (true):
+    
+    if (chaseStartTime == 0) {     // Якщо таймер ще не був запущений:
+      chaseStartTime = millis();   // Запам'ятовуємо час старту
+      previousMillis = millis();   // Ініціалізуємо неблокуючий таймер подій
+    }
 
-    // Виводимо чергову букву з нашого слова
-    showChar(policeWord[currentLetter]);
-    currentLetter++; // Збільшуємо номер букви на 1 для наступного разу
+    // Рахуємо загальну кількість минулих мілісекунд від старти
+    unsigned long elapsedMillis = millis() - chaseStartTime;
 
-    // Фаза 1 сирени
-    digitalWrite(LED_PIN_1, HIGH); // Вмикаємо перший світлодіод
-    digitalWrite(LED_PIN_2, LOW);  // Вимикаємо другий світлодіод
-    tone(BUZZER_PIN, 900);
-    delay(200);                    // Чекаємо 200 мілісекунд
+    unsigned long totalSeconds = elapsedMillis / 1000;    // Секунди (займають перші 3 знаки)
+    int tenths = (elapsedMillis % 1000) / 100;            // Остання цифра: 0-9 (десяті долі секунди)
 
+    char timeStr[5];               
+    // Форматуємо рядок: 3 знаки для секунд і 1 знак для десятих (напр. "0053" = 5.3 сек)
+    sprintf(timeStr, "%03d%1d", (int)(totalSeconds % 1000), tenths); 
+    disp4.displayString(timeStr);  // Миттєво виводимо час на дисплей без жодних затримок
+
+    // НЕБЛОКУЮЧА СИРЕНА ТА МАТРИЦЯ: спрацьовує кожні 200 мс у фоновому режимі
+    if (millis() - previousMillis >= interval) {
+      previousMillis = millis();   // Зберігаємо час останнього спрацювання
+
+      sirenPhase = !sirenPhase;    // Змінюємо фазу сирени на протилежну
+
+      if (sirenPhase) {
+        // --- Фаза 1 мигалки та сирени ---
+        digitalWrite(LED_PIN_1, HIGH); // Увімкнути перший світлодіод
+        digitalWrite(LED_PIN_2, LOW);  // Вимкнути другий світлодіод
+        tone(BUZZER_PIN, 900);         // Увімкнути бузер на частоті 900 Гц
+      } else {
+        // --- Фаза 2 мигалки та сирени ---
+        digitalWrite(LED_PIN_1, LOW);  // Вимкнути перший світлодіод
+        digitalWrite(LED_PIN_2, HIGH); // Увімкнути другий світлодіод
+        tone(BUZZER_PIN, 600);         // Увімкнути бузер на частоті 600 Гц
+      }
+
+      // Виводимо чергову літеру слова "POLICE"
+      showChar(policeWord[currentLetter]); 
+      currentLetter++;             // Переходимо до наступної літери
+
+      if (currentLetter >= 6) {    // Якщо дійшли до кінця слова:
+        currentLetter = 0;         // Скидаємо індекс на початок ('P')
+      }
+    }
+
+  } else {                         // Якщо режим роботи вимкнено (false):
     digitalWrite(LED_PIN_1, LOW);  // Вимикаємо перший світлодіод
-    digitalWrite(LED_PIN_2, HIGH); // Вмикаємо другий світлодіод
-    tone(BUZZER_PIN, 600);
-    delay(200);                    // Чекаємо 200 мілісекунд
-
-
-    if (currentLetter >= 6) {
-      currentLetter = 0; // Скидаємо лічильник на початок слова ('P')
-
-      for (int i = 0; i < 3; i++) {
-        matrix.fillRect(0, 0, 8, 8, LED_ON); // Увімкнути абсолютно всі світлодіоди
-        matrix.writeDisplay();
-        delay(150);
-
-        matrix.clear(); // Вимкнути все
-        matrix.writeDisplay();
-        delay(150);
-      } 
-
-
-  } else {
-    // Якщо режим вимкнений — погасити обидва світлодіоди
-    digitalWrite(LED_PIN_1, LOW);  // Вимикаємо перший світлодіод
     digitalWrite(LED_PIN_2, LOW);  // Вимикаємо другий світлодіод
-    noTone(BUZZER_PIN);
-    matrix.clear();
-    matrix.writeDisplay();
-    delay(50);                     // Коротка затримка, щоб не перевантажувати процесор
+    noTone(BUZZER_PIN);            // Вимикаємо звук бузера
+    currentLetter = 0;             // Скидаємо індекс слова
+    chaseStartTime = 0;            // Скидаємо час старту секундоміра
+    matrix.clear();                // Очищаємо матрицю 8x8
+    matrix.writeDisplay();         // Застосовуємо очищення матриці
+
+    char clearStr[] = "    ";
+    disp4.displayString(clearStr); // Очищаємо дисплей за допомогою масиву
+    delay(50);                     // Коротка технічна затримка для розвантаження CPU
   }
-
-}
 }
